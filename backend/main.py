@@ -5,6 +5,7 @@ import faiss
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from huggingface_hub import InferenceClient, hf_hub_download
@@ -12,17 +13,28 @@ from passlib.context import CryptContext
 from jose import jwt, JWTError
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict  # Updated imports
+from typing import Optional, List, Dict
 from dotenv import load_dotenv
 
 # --- 1. KONFIGURASI ---
-DATASET_ID = "gekina/dataset_qna" 
+load_dotenv()
+DATASET_ID = "gekina/dataset_qna"
 REPO_ID = "Qwen/Qwen2.5-7B-Instruct"
 HF_TOKEN = os.getenv("HF_TOKEN")
 SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = "HS256"
 
 app = FastAPI()
+
+# --- SETUP CORS (PENTING) ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 client = InferenceClient(model=REPO_ID, token=HF_TOKEN)
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/token")
@@ -30,7 +42,7 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/token")
 # --- 2. DATABASE INIT ---
 DB_PATH = "/data/users.db" if os.path.exists("/data") else "users.db"
 
-def get_password_hash(password): 
+def get_password_hash(password):
     return pwd_context.hash(password)
 
 def init_db():
@@ -78,7 +90,6 @@ try:
     index = faiss.read_index(faiss_path)
     
     print(f"✅ Database Medis Siap! Total baris: {len(df_chunks)}")
-    print(f"✅ Kolom tersedia: {df_chunks.columns.tolist()}") 
 except Exception as e:
     print(f"⚠️ Gagal Load Data: {e}")
 
@@ -126,7 +137,7 @@ class UserSelfUpdate(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str
-    history: List[Dict[str, str]] = [] # Updated: Support Context History
+    history: List[Dict[str, str]] = [] 
 
 # --- 5. API ENDPOINTS ---
 
@@ -189,12 +200,21 @@ def get_all_users(admin: str = Depends(get_current_admin)):
     conn.close()
     return users
 
+# --- PERBAIKAN: MENDEFINISIKAN CURSOR 'c' ---
 @app.delete("/api/admin/users/{username}")
 def delete_user(username: str, admin: str = Depends(get_current_admin)):
     if username == "admin": raise HTTPException(status_code=400, detail="Tidak bisa hapus Super Admin")
+    
     conn = sqlite3.connect(DB_PATH)
-    c.execute("DELETE FROM users WHERE username=?", (username,))
-    conn.commit()
+    c = conn.cursor() # FIXED: Definisi cursor ditambahkan
+    
+    try:
+        c.execute("DELETE FROM users WHERE username=?", (username,))
+        conn.commit()
+    except Exception as e:
+        conn.close()
+        raise HTTPException(status_code=500, detail=f"Gagal menghapus user: {str(e)}")
+    
     conn.close()
     return {"message": f"User {username} dihapus"}
 
@@ -208,12 +228,53 @@ def update_user(username: str, user_data: UserUpdate, admin: str = Depends(get_c
     conn.close()
     return {"message": "Update berhasil"}
 
-# --- CHAT API (UPDATED FOR CONTEXT) ---
+# --- FUNGSI GUARDRAIL (BALANCED VERSION) ---
+def check_is_medical(query: str) -> bool:
+    """
+    Menilai apakah pertanyaan berhubungan dengan medis.
+    Prompt dibuat lebih inklusif agar tidak memblokir pertanyaan borderline.
+    """
+    classification_prompt = (
+        "Anda adalah sistem klasifikasi topik otomatis.\n"
+        "Tugas: Tentukan apakah pertanyaan user ada hubungannya (langsung atau tidak langsung) dengan:\n"
+        "- Kesehatan (Fisik/Mental)\n"
+        "- Penyakit & Gejala\n"
+        "- Obat & Pengobatan\n"
+        "- Biologi Manusia\n"
+        "- Gaya Hidup Sehat (Diet, Olahraga untuk kesehatan)\n\n"
+        "INSTRUKSI: Jawab 'YA' jika ada sedikit saja hubungan dengan kesehatan. Jawab 'TIDAK' hanya jika 100% tidak relevan (seperti Coding, Politik, Matematika).\n\n"
+        f"Pertanyaan: {query}\n"
+        "Jawaban (YA/TIDAK):"
+    )
+    
+    try:
+        response = client.chat_completion(
+            messages=[{"role": "user", "content": classification_prompt}],
+            max_tokens=5, 
+            temperature=0.0
+        )
+        answer = response.choices[0].message.content.strip().upper()
+        # Logika: Default ke True (YA) jika AI ragu atau menjawab selain TIDAK
+        return "TIDAK" not in answer 
+    except:
+        # Fail-Safe: Jika Guardrail error, IZINKAN lewat
+        return True 
+
+# --- CHAT API (BALANCED FILTERING) ---
 @app.post("/api/chat")
 def chat(req: ChatRequest, username: str = Depends(get_current_user)):
     # 0. Cek Database
     if index is None: 
-        return {"response": "Maaf, database medis sedang offline atau dalam perbaikan.", "urls": []}
+        return {"response": "Maaf, database medis sedang offline.", "urls": []}
+
+    # --- LANGKAH 1: LLM GUARDRAIL ---
+    is_medical = check_is_medical(req.message)
+    
+    if not is_medical:
+        return {
+            "response": "Maaf, saya adalah asisten medis (MediChat). Saya hanya dilatih untuk menjawab pertanyaan seputar kesehatan dan kedokteran.",
+            "urls": []
+        }
 
     # 1. Deteksi Kolom URL
     url_col_name = None
@@ -222,23 +283,21 @@ def chat(req: ChatRequest, username: str = Depends(get_current_user)):
             url_col_name = col
             break
 
-    # 2. Context Rewriting (Gabungkan history jika ada)
-    # Tujuannya: Mengubah "Obatnya apa?" menjadi "Obatnya apa [Penyakit Tadi]?"
+    # 2. Context Rewriting
     search_query = req.message
     if req.history:
-        # Ambil pesan user terakhir dari history (jika ada)
         last_user_msg = next((h['content'] for h in reversed(req.history) if h['role'] == 'user'), "")
         if last_user_msg:
             search_query = f"{last_user_msg} {req.message}"
-            print(f"🔍 Contextual Query: {search_query}")
+            search_query = search_query[-500:]
 
     # 3. Retrieval FAISS
     try:
         q_emb = embedder.encode([f"query: {search_query}"], normalize_embeddings=True)
-        D, I = index.search(q_emb, k=10)
+        D, I = index.search(q_emb, k=15) # Ambil lebih banyak kandidat
     except Exception as e:
         print(f"Error FAISS: {e}")
-        return {"response": "Terjadi kendala teknis saat mencari data.", "urls": []}
+        return {"response": "Terjadi kendala teknis.", "urls": []}
     
     candidates = []
     candidate_indices = []
@@ -253,28 +312,32 @@ def chat(req: ChatRequest, username: str = Depends(get_current_user)):
                 candidate_indices.append(idx)
                 seen.add(p_id)
 
-    # 4. Reranking (Gunakan search_query agar relevan)
-    top_results = []
+    # 4. Reranking & Thresholding
+    final_context = []
+    final_indices = []
+    
     if candidates:
-        pairs = [[search_query, doc] for doc in candidates]
         try:
+            pairs = [[search_query, doc] for doc in candidates]
             scores = reranker.predict(pairs)
             combined = sorted(list(zip(candidates, scores, candidate_indices)), key=lambda x: x[1], reverse=True)
             
-            # Threshold Reranker (Cegah data sampah masuk)
-            top_results = [item for item in combined[:3] if item[1] > -2.0]
-        except:
-            # Fallback jika reranker gagal
-            top_results = list(zip(candidates[:3], [0]*3, candidate_indices[:3]))
-    
-    final_context = [item[0] for item in top_results]
-    final_indices = [item[2] for item in top_results]
-    
-    # 5. HARD STOP (PENTING: Mencegah bahasa Mandarin/Halusinasi)
-    # Jika tidak ada konteks yang relevan ditemukan, tolak langsung.
+            # === BALANCED THRESHOLD: -0.5 ===
+            # Tidak seketat 0.15, tapi membuang sampah (-2.0 ke bawah)
+            top_results = [item for item in combined[:3] if item[1] > -0.5]
+            
+            final_context = [item[0] for item in top_results]
+            final_indices = [item[2] for item in top_results]
+        
+        except Exception as e:
+            # Fail-secure
+            print(f"Reranker Error: {e}")
+            final_context = [] 
+
+    # 5. HARD STOP
     if not final_context:
         return {
-            "response": "Mohon maaf, saya belum menemukan informasi spesifik mengenai keluhan tersebut dalam database referensi medis saya. Mohon sebutkan nama penyakit atau gejala secara lebih lengkap agar saya dapat membantu.",
+            "response": "Mohon maaf, meskipun pertanyaan Anda terkait medis, saya belum menemukan referensi spesifik yang pas di database saya. Bisa coba formulasi ulang pertanyaannya?",
             "urls": []
         }
 
@@ -291,23 +354,28 @@ def chat(req: ChatRequest, username: str = Depends(get_current_user)):
     
     system_prompt = (
         "Anda adalah Asisten Medis Profesional bernama MediChat.\n"
-        "INSTRUKSI WAJIB:\n"
-        "1. GUNAKAN HANYA BAHASA INDONESIA. Jangan gunakan Bahasa Mandarin atau Inggris.\n"
-        "2. Jawab pertanyaan HANYA berdasarkan informasi di dalam 'KONTEKS MEDIS' di bawah ini.\n"
-        "3. JANGAN mengarang atau menggunakan pengetahuan di luar konteks yang diberikan.\n"
-        "4. Jika informasi tidak ada di konteks, katakan: 'Maaf, referensi saya tidak memuat informasi detil mengenai hal tersebut.'\n\n"
+        "INSTRUKSI:\n"
+        "1. Jawab pertanyaan berdasarkan 'KONTEKS MEDIS' di bawah.\n"
+        "2. Jika informasi di konteks kurang lengkap, jelaskan apa yang ada saja.\n"
+        "3. GUNAKAN BAHASA INDONESIA.\n"
         f"KONTEKS MEDIS:\n{context_str}"
     )
 
     messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": req.message}]
     
     try:
-        response = client.chat_completion(messages, max_tokens=2048, temperature=0.1)
+        response = client.chat_completion(
+            messages, 
+            max_tokens=1024, 
+            temperature=0.1, 
+            top_p=0.9
+        )
         answer = response.choices[0].message.content
         return {"response": answer, "urls": source_urls}
+    
     except Exception as e:
         print(f"ERROR LLM: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"response": "Mohon maaf, terjadi gangguan koneksi.", "urls": []}
 
 # --- SERVE REACT ---
 current_dir = os.path.dirname(os.path.abspath(__file__))
